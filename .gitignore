@@ -1,0 +1,26 @@
+# Binary
+/proxy-server
+
+# Config files with sensitive data
+.env
+#proxies.conf
+#users.conf
+
+# Go specific
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# MacOS
+.DS_Store
+
+# Temp files
+*.log
+*.tmp

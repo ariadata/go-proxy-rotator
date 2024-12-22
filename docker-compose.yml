@@ -1,0 +1,20 @@
+services:
+  go-proxy-rotator:
+    image: 'ghcr.io/ariadata/go-proxy-rotator:latest'
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: go-proxy-rotator
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - '${DC_SOCKS_PROXY_PORT:-1080}:1080'
+    volumes:
+      - ./proxies.conf:/app/proxies.conf
+      - ./users.conf:/app/users.conf
+    healthcheck:
+      test: [ "CMD", "nc", "-z", "localhost", "1080" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
