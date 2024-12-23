@@ -15,11 +15,11 @@ import (
 	"os"
 	"strings"
 	"sync"
-	"time"
 )
 
 type ProxyConfig struct {
 	proxyURL *url.URL
+	isDirect bool // Indicates if this is a direct connection
 }
 
 type ProxyManager struct {
@@ -27,28 +27,32 @@ type ProxyManager struct {
 	currentIdx int
 	mu         sync.Mutex
 	enableEdge bool
-	lastUsed   time.Time
 }
 
 func NewProxyManager(enableEdge bool) *ProxyManager {
-	return &ProxyManager{
+	pm := &ProxyManager{
 		proxies:    make([]*ProxyConfig, 0),
 		enableEdge: enableEdge,
-		lastUsed:   time.Now(),
 	}
+
+	// If edge mode is enabled, add direct connection as first proxy
+	if enableEdge {
+		pm.proxies = append(pm.proxies, &ProxyConfig{isDirect: true})
+	}
+
+	return pm
 }
 
 func (pm *ProxyManager) LoadProxies(filename string) error {
 	file, err := os.Open(filename)
 	if err != nil {
 		if pm.enableEdge {
+			// If edge mode is enabled and no proxy file, that's okay - we still have direct
 			return nil
 		}
 		return err
 	}
-	defer func(file *os.File) {
-		_ = file.Close()
-	}(file)
+	defer file.Close()
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
@@ -62,7 +66,10 @@ func (pm *ProxyManager) LoadProxies(filename string) error {
 			return fmt.Errorf("invalid proxy URL: %s", err)
 		}
 
-		pm.proxies = append(pm.proxies, &ProxyConfig{proxyURL: proxyURL})
+		pm.proxies = append(pm.proxies, &ProxyConfig{
+			proxyURL: proxyURL,
+			isDirect: false,
+		})
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -84,32 +91,10 @@ func (pm *ProxyManager) GetNextProxy() (*ProxyConfig, error) {
 		return nil, fmt.Errorf("no proxies available")
 	}
 
-	// Always increment the index
 	proxy := pm.proxies[pm.currentIdx]
 	pm.currentIdx = (pm.currentIdx + 1) % len(pm.proxies)
 
-	// Update last used time
-	pm.lastUsed = time.Now()
-
 	return proxy, nil
-}
-
-func (pm *ProxyManager) ShouldUseDirect() bool {
-	pm.mu.Lock()
-	defer pm.mu.Unlock()
-
-	if !pm.enableEdge {
-		return false
-	}
-
-	// If we have no proxies, always use direct
-	if len(pm.proxies) == 0 {
-		return true
-	}
-
-	// In edge mode with proxies, use direct connection periodically
-	// This ensures we rotate through direct connection as well
-	return time.Since(pm.lastUsed) > 5*time.Second
 }
 
 type ProxyDialer struct {
@@ -117,40 +102,18 @@ type ProxyDialer struct {
 }
 
 func (d *ProxyDialer) Dial(ctx context.Context, network, addr string) (net.Conn, error) {
-	var lastError error
-
-	// Check if we should try direct connection first
-	if d.manager.ShouldUseDirect() {
-		conn, err := net.Dial(network, addr)
-		if err == nil {
-			return conn, nil
-		}
-		lastError = err
+	proxy, err := d.manager.GetNextProxy()
+	if err != nil {
+		return nil, err
 	}
 
-	// If we have proxies, try them
-	if len(d.manager.proxies) > 0 {
-		proxy, err := d.manager.GetNextProxy()
-		if err != nil {
-			if lastError != nil {
-				return nil, fmt.Errorf("direct connection failed: %v, proxy error: %v", lastError, err)
-			}
-			return nil, err
-		}
-
-		conn, err := d.dialWithProxy(proxy, network, addr)
-		if err == nil {
-			return conn, nil
-		}
-		lastError = err
-	} else if !d.manager.enableEdge {
-		return nil, fmt.Errorf("no proxies available and edge mode is disabled")
+	// Handle direct connection
+	if proxy.isDirect {
+		return net.Dial(network, addr)
 	}
 
-	if lastError != nil {
-		return nil, fmt.Errorf("all connection attempts failed, last error: %v", lastError)
-	}
-	return nil, fmt.Errorf("no connection methods available")
+	// Handle proxy connection
+	return d.dialWithProxy(proxy, network, addr)
 }
 
 func (d *ProxyDialer) dialWithProxy(proxy *ProxyConfig, network, addr string) (net.Conn, error) {
