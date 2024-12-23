@@ -15,6 +15,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 )
 
 type ProxyConfig struct {
@@ -26,12 +27,14 @@ type ProxyManager struct {
 	currentIdx int
 	mu         sync.Mutex
 	enableEdge bool
+	lastUsed   time.Time
 }
 
 func NewProxyManager(enableEdge bool) *ProxyManager {
 	return &ProxyManager{
 		proxies:    make([]*ProxyConfig, 0),
 		enableEdge: enableEdge,
+		lastUsed:   time.Now(),
 	}
 }
 
@@ -39,7 +42,6 @@ func (pm *ProxyManager) LoadProxies(filename string) error {
 	file, err := os.Open(filename)
 	if err != nil {
 		if pm.enableEdge {
-			// If edge mode is enabled and no proxy file, that's okay
 			return nil
 		}
 		return err
@@ -55,24 +57,18 @@ func (pm *ProxyManager) LoadProxies(filename string) error {
 			continue
 		}
 
-		proxyStr := line
-		proxyURL, err := url.Parse(proxyStr)
+		proxyURL, err := url.Parse(line)
 		if err != nil {
 			return fmt.Errorf("invalid proxy URL: %s", err)
 		}
 
-		proxy := &ProxyConfig{
-			proxyURL: proxyURL,
-		}
-
-		pm.proxies = append(pm.proxies, proxy)
+		pm.proxies = append(pm.proxies, &ProxyConfig{proxyURL: proxyURL})
 	}
 
 	if err := scanner.Err(); err != nil {
 		return err
 	}
 
-	// Only return error if no proxies AND edge mode is disabled
 	if len(pm.proxies) == 0 && !pm.enableEdge {
 		return fmt.Errorf("no proxies loaded from configuration and edge mode is disabled")
 	}
@@ -88,10 +84,32 @@ func (pm *ProxyManager) GetNextProxy() (*ProxyConfig, error) {
 		return nil, fmt.Errorf("no proxies available")
 	}
 
+	// Always increment the index
 	proxy := pm.proxies[pm.currentIdx]
 	pm.currentIdx = (pm.currentIdx + 1) % len(pm.proxies)
 
+	// Update last used time
+	pm.lastUsed = time.Now()
+
 	return proxy, nil
+}
+
+func (pm *ProxyManager) ShouldUseDirect() bool {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	if !pm.enableEdge {
+		return false
+	}
+
+	// If we have no proxies, always use direct
+	if len(pm.proxies) == 0 {
+		return true
+	}
+
+	// In edge mode with proxies, use direct connection periodically
+	// This ensures we rotate through direct connection as well
+	return time.Since(pm.lastUsed) > 5*time.Second
 }
 
 type ProxyDialer struct {
@@ -99,40 +117,40 @@ type ProxyDialer struct {
 }
 
 func (d *ProxyDialer) Dial(ctx context.Context, network, addr string) (net.Conn, error) {
-	if d.manager.enableEdge {
-		// If edge mode is enabled, try direct connection first
+	var lastError error
+
+	// Check if we should try direct connection first
+	if d.manager.ShouldUseDirect() {
 		conn, err := net.Dial(network, addr)
 		if err == nil {
 			return conn, nil
 		}
-		// Only continue to proxies if we have any
-		if len(d.manager.proxies) == 0 {
-			return nil, fmt.Errorf("direct connection failed: %v", err)
-		}
+		lastError = err
 	}
 
-	// If we get here and have no proxies, return error
-	if len(d.manager.proxies) == 0 {
-		return nil, fmt.Errorf("no proxies available and edge mode is disabled")
-	}
-
-	// Try each proxy until one succeeds
-	var lastError error
-	for i := 0; i < len(d.manager.proxies); i++ {
+	// If we have proxies, try them
+	if len(d.manager.proxies) > 0 {
 		proxy, err := d.manager.GetNextProxy()
 		if err != nil {
+			if lastError != nil {
+				return nil, fmt.Errorf("direct connection failed: %v, proxy error: %v", lastError, err)
+			}
 			return nil, err
 		}
 
 		conn, err := d.dialWithProxy(proxy, network, addr)
-		if err != nil {
-			lastError = err
-			continue
+		if err == nil {
+			return conn, nil
 		}
-		return conn, nil
+		lastError = err
+	} else if !d.manager.enableEdge {
+		return nil, fmt.Errorf("no proxies available and edge mode is disabled")
 	}
 
-	return nil, fmt.Errorf("all proxies failed, last error: %v", lastError)
+	if lastError != nil {
+		return nil, fmt.Errorf("all connection attempts failed, last error: %v", lastError)
+	}
+	return nil, fmt.Errorf("no connection methods available")
 }
 
 func (d *ProxyDialer) dialWithProxy(proxy *ProxyConfig, network, addr string) (net.Conn, error) {
@@ -283,19 +301,15 @@ func main() {
 		log.Fatal(err)
 	}
 
-	port := os.Getenv("DC_SOCKS_PROXY_PORT")
-	if port == "" {
-		port = "1080"
-	}
+	log.Printf("SOCKS5 server running on :1080 (Edge Mode: %v, Users: %d, Proxies: %d)\n",
+		enableEdge, len(credentials), len(proxyManager.proxies))
 
-	log.Printf("SOCKS5 server running on :%s (Edge Mode: %v, Users: %d, Proxies: %d)\n",
-		port, enableEdge, len(credentials), len(proxyManager.proxies))
-	if err := server.ListenAndServe("tcp", ":"+port); err != nil {
+	// Always listen on port 1080 inside container
+	if err := server.ListenAndServe("tcp", ":1080"); err != nil {
 		log.Fatal(err)
 	}
 }
 
-// Helper functions for SOCKS5
 func performSocks5Handshake(conn net.Conn, proxyURL *url.URL) error {
 	_, err := conn.Write([]byte{0x05, 0x01, 0x02})
 	if err != nil {
