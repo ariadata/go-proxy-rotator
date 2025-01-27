@@ -201,7 +201,8 @@ func loadUserCredentials(filename string) (socks5.StaticCredentials, error) {
 
 	file, err := os.Open(filename)
 	if err != nil {
-		return nil, err
+		// If the file is empty or doesn't exist, return empty credentials
+		return credentials, nil
 	}
 	defer func(file *os.File) {
 		_ = file.Close()
@@ -225,10 +226,6 @@ func loadUserCredentials(filename string) (socks5.StaticCredentials, error) {
 		return nil, err
 	}
 
-	if len(credentials) == 0 {
-		return nil, fmt.Errorf("no valid credentials found in users.conf")
-	}
-
 	return credentials, nil
 }
 
@@ -250,13 +247,17 @@ func main() {
 
 	dialer := &ProxyDialer{manager: proxyManager}
 
-	// Create SOCKS5 server configuration with authentication
+	// Create SOCKS5 server configuration with or without authentication
 	conf := &socks5.Config{
-		Dial:        dialer.Dial,
-		Credentials: credentials,
-		AuthMethods: []socks5.Authenticator{socks5.UserPassAuthenticator{
+		Dial: dialer.Dial,
+	}
+
+	// Only set credentials and auth methods if there are any credentials
+	if len(credentials) > 0 {
+		conf.Credentials = credentials
+		conf.AuthMethods = []socks5.Authenticator{socks5.UserPassAuthenticator{
 			Credentials: credentials,
-		}},
+		}}
 	}
 
 	server, err := socks5.New(conf)
