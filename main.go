@@ -19,7 +19,7 @@ import (
 
 type ProxyConfig struct {
 	proxyURL *url.URL
-	isDirect bool // Indicates if this is a direct connection
+	isDirect bool
 }
 
 type ProxyManager struct {
@@ -35,7 +35,6 @@ func NewProxyManager(enableEdge bool) *ProxyManager {
 		enableEdge: enableEdge,
 	}
 
-	// If edge mode is enabled, add direct connection as first proxy
 	if enableEdge {
 		pm.proxies = append(pm.proxies, &ProxyConfig{isDirect: true})
 	}
@@ -47,7 +46,6 @@ func (pm *ProxyManager) LoadProxies(filename string) error {
 	file, err := os.Open(filename)
 	if err != nil {
 		if pm.enableEdge {
-			// If edge mode is enabled and no proxy file, that's okay - we still have direct
 			return nil
 		}
 		return err
@@ -77,7 +75,7 @@ func (pm *ProxyManager) LoadProxies(filename string) error {
 	}
 
 	if len(pm.proxies) == 0 && !pm.enableEdge {
-		return fmt.Errorf("no proxies loaded from configuration and edge mode is disabled")
+		return fmt.Errorf("no proxies loaded and edge mode disabled")
 	}
 
 	return nil
@@ -93,7 +91,6 @@ func (pm *ProxyManager) GetNextProxy() (*ProxyConfig, error) {
 
 	proxy := pm.proxies[pm.currentIdx]
 	pm.currentIdx = (pm.currentIdx + 1) % len(pm.proxies)
-
 	return proxy, nil
 }
 
@@ -107,12 +104,10 @@ func (d *ProxyDialer) Dial(ctx context.Context, network, addr string) (net.Conn,
 		return nil, err
 	}
 
-	// Handle direct connection
 	if proxy.isDirect {
 		return net.Dial(network, addr)
 	}
 
-	// Handle proxy connection
 	return d.dialWithProxy(proxy, network, addr)
 }
 
@@ -134,8 +129,7 @@ func (d *ProxyDialer) dialSocks5(proxy *ProxyConfig, addr string) (net.Conn, err
 	}
 
 	if proxy.proxyURL.User != nil {
-		err = performSocks5Handshake(conn, proxy.proxyURL)
-		if err != nil {
+		if err := performSocks5Handshake(conn, proxy.proxyURL); err != nil {
 			_ = conn.Close()
 			return nil, err
 		}
@@ -156,9 +150,7 @@ func (d *ProxyDialer) dialHTTP(proxy *ProxyConfig, network, addr string) (net.Co
 	}
 
 	if proxy.proxyURL.Scheme == "https" {
-		tlsConn := tls.Client(conn, &tls.Config{
-			InsecureSkipVerify: true,
-		})
+		tlsConn := tls.Client(conn, &tls.Config{InsecureSkipVerify: true})
 		if err := tlsConn.Handshake(); err != nil {
 			_ = conn.Close()
 			return nil, err
@@ -201,12 +193,9 @@ func loadUserCredentials(filename string) (socks5.StaticCredentials, error) {
 
 	file, err := os.Open(filename)
 	if err != nil {
-		// If the file is empty or doesn't exist, return empty credentials
-		return credentials, nil
+		return credentials, nil // Return empty credentials if file missing
 	}
-	defer func(file *os.File) {
-		_ = file.Close()
-	}(file)
+	defer file.Close()
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
@@ -217,7 +206,7 @@ func loadUserCredentials(filename string) (socks5.StaticCredentials, error) {
 
 		parts := strings.Split(line, ":")
 		if len(parts) != 2 {
-			return nil, fmt.Errorf("invalid credentials format in users.conf: %s", line)
+			return nil, fmt.Errorf("invalid credential format: %s", line)
 		}
 		credentials[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
 	}
@@ -230,34 +219,27 @@ func loadUserCredentials(filename string) (socks5.StaticCredentials, error) {
 }
 
 func main() {
-	// Load user credentials from file
 	credentials, err := loadUserCredentials("users.conf")
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	// Check if edge mode is enabled
 	enableEdge := os.Getenv("ENABLE_EDGE_MODE") == "true"
 
-	// Initialize proxy manager
 	proxyManager := NewProxyManager(enableEdge)
 	if err := proxyManager.LoadProxies("proxies.conf"); err != nil {
 		log.Fatal(err)
 	}
 
-	dialer := &ProxyDialer{manager: proxyManager}
-
-	// Create SOCKS5 server configuration with or without authentication
 	conf := &socks5.Config{
-		Dial: dialer.Dial,
+		Dial: (&ProxyDialer{manager: proxyManager}).Dial,
 	}
 
-	// Only set credentials and auth methods if there are any credentials
 	if len(credentials) > 0 {
 		conf.Credentials = credentials
-		conf.AuthMethods = []socks5.Authenticator{socks5.UserPassAuthenticator{
-			Credentials: credentials,
-		}}
+		conf.AuthMethods = []socks5.Authenticator{
+			socks5.UserPassAuthenticator{Credentials: credentials},
+		}
 	}
 
 	server, err := socks5.New(conf)
@@ -265,18 +247,16 @@ func main() {
 		log.Fatal(err)
 	}
 
-	log.Printf("SOCKS5 server running on :1080 (Edge Mode: %v, Users: %d, Proxies: %d)\n",
-		enableEdge, len(credentials), len(proxyManager.proxies))
+	log.Printf("SOCKS5 server running on :1080 (Auth: %t, Edge Mode: %t, Proxies: %d)",
+		len(credentials) > 0, enableEdge, len(proxyManager.proxies))
 
-	// Always listen on port 1080 inside container
 	if err := server.ListenAndServe("tcp", ":1080"); err != nil {
 		log.Fatal(err)
 	}
 }
 
 func performSocks5Handshake(conn net.Conn, proxyURL *url.URL) error {
-	_, err := conn.Write([]byte{0x05, 0x01, 0x02})
-	if err != nil {
+	if _, err := conn.Write([]byte{0x05, 0x01, 0x02}); err != nil {
 		return err
 	}
 
@@ -294,9 +274,9 @@ func performSocks5Handshake(conn net.Conn, proxyURL *url.URL) error {
 
 	auth := []byte{0x01}
 	auth = append(auth, byte(len(username)))
-	auth = append(auth, []byte(username)...)
+	auth = append(auth, username...)
 	auth = append(auth, byte(len(password)))
-	auth = append(auth, []byte(password)...)
+	auth = append(auth, password...)
 
 	if _, err := conn.Write(auth); err != nil {
 		return err
@@ -323,19 +303,20 @@ func sendSocks5Connect(conn net.Conn, addr string) error {
 	req := []byte{0x05, 0x01, 0x00}
 	ip := net.ParseIP(host)
 
-	if ip == nil {
+	switch {
+	case ip == nil:
 		req = append(req, 0x03, byte(len(host)))
-		req = append(req, []byte(host)...)
-	} else if ip4 := ip.To4(); ip4 != nil {
+		req = append(req, host...)
+	case ip.To4() != nil:
 		req = append(req, 0x01)
-		req = append(req, ip4...)
-	} else {
+		req = append(req, ip.To4()...)
+	default:
 		req = append(req, 0x04)
 		req = append(req, ip.To16()...)
 	}
 
 	portNum := uint16(0)
-	_, _ = fmt.Sscanf(port, "%d", &portNum)
+	fmt.Sscanf(port, "%d", &portNum)
 	req = append(req, byte(portNum>>8), byte(portNum&0xff))
 
 	if _, err := conn.Write(req); err != nil {
@@ -353,15 +334,14 @@ func sendSocks5Connect(conn net.Conn, addr string) error {
 
 	switch resp[3] {
 	case 0x01:
-		_, err = io.ReadFull(conn, make([]byte, 4+2))
+		_, err = io.ReadFull(conn, make([]byte, 6))
 	case 0x03:
 		size := make([]byte, 1)
-		_, err = io.ReadFull(conn, size)
-		if err == nil {
+		if _, err = io.ReadFull(conn, size); err == nil {
 			_, err = io.ReadFull(conn, make([]byte, int(size[0])+2))
 		}
 	case 0x04:
-		_, err = io.ReadFull(conn, make([]byte, 16+2))
+		_, err = io.ReadFull(conn, make([]byte, 18))
 	}
 
 	return err
