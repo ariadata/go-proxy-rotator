@@ -96,8 +96,10 @@ docker run -d \
 
 ## License
 
-MIT License
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
+
+By contributing to this project, you agree that your contributions will be licensed under the MIT License.
